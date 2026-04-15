@@ -90,11 +90,20 @@ async def process_document(file: UploadFile = File(...)):
         print("[PROCESS] Step 3/3 — Saving report to MongoDB...")
         response_dict = json.loads(annotations_response.model_dump_json())
 
-        # Promote document_annotation from first page to root for frontend convenience
+        # Promote document_annotation from the first page that actually has one.
+        # (Chunk-based OCR attaches it per-chunk, so page[0] may be empty.)
         if response_dict.get("pages"):
-            first_page = response_dict["pages"][0]
-            if "document_annotation" in first_page:
-                response_dict["document_annotation"] = first_page["document_annotation"]
+            doc_annotation = None
+            for page in response_dict["pages"]:
+                da = page.get("document_annotation")
+                if da and da.get("language"):
+                    doc_annotation = da
+                    break
+            # Fallback: use whatever is in the first page, even if incomplete
+            if doc_annotation is None:
+                doc_annotation = response_dict["pages"][0].get("document_annotation")
+            if doc_annotation:
+                response_dict["document_annotation"] = doc_annotation
 
         # URL stored WITHOUT /api prefix — the static mount serves at /outputs/
         # The Vite proxy rewrites /api/* → /* so the frontend uses /api/outputs/
