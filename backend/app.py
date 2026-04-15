@@ -27,7 +27,7 @@ import time
 import shutil
 import traceback
 
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -99,46 +99,43 @@ app.mount("/outputs", StaticFiles(directory=OUTPUT_FOLDER), name="outputs")
 # ─── Route: Process a PDF ────────────────────────────────────────────────────
 
 @app.post("/process")
-async def process_document(file: UploadFile = File(...)):
+async def process_document(
+    file: UploadFile = File(...),
+    # Advanced OCR Options (Form fields)
+    table_format: str = Form(None),           # "html", "markdown", "null"
+    confidence_level: str = Form(None),      # "page", "word", "null"
+    extract_header: bool = Form(False),
+    extract_footer: bool = Form(False)
+):
     """
     Main endpoint — accepts a PDF upload, runs the full OCR pipeline, and returns results.
-
-    Pipeline:
-      Step 1 → Save the uploaded file temporarily to disk
-      Step 2 → Run Mistral OCR via ocr_annotations_service (base64 inline, chunked)
-      Step 3 → Generate a highlighted PDF report via pdf_highlight service
-      Step 4 → Serialise OCR results and save the full report to MongoDB
-      Step 5 → Return the result JSON to the frontend
-
-    Response (on success):
-        {
-          "success":     true,
-          "id":          "<mongodb_report_id>",
-          "pdf_url":     "/outputs/<highlighted_filename>",
-          "annotations": { <full mistral ocr result with document_annotation at root> },
-          "markdown":    "<full extracted plain text>",
-          "stats":       { "time_taken": 42.1, "pages": 8, "cost": 0.024, "empty_pages": 1 }
-        }
+    
+    The API now accepts advanced options matching the Mistral 'Playground' capabilities:
+      - table_format: extract tables as HTML or Markdown strings
+      - confidence_level: granularity of AI confidence scores
+      - extract_header/footer: separate extraction of page headers/footers
     """
     # Save the uploaded file to disk (needed because the OCR service reads it from a path)
     temp_file_path = os.path.join(UPLOAD_FOLDER, file.filename)
     print(f"\n[PROCESS] ── Received: '{file.filename}' ──────────────────────────")
+
+    # Map "null" strings from frontend back to None for the SDK logic
+    t_fmt = table_format if table_format != "null" else None
+    c_lvl = confidence_level if confidence_level != "null" else None
 
     with open(temp_file_path, "wb") as temp_file:
         shutil.copyfileobj(file.file, temp_file)
 
     try:
         # ── Step 1: Run Mistral OCR ───────────────────────────────────────────
-        #
-        # process_ocr_with_annotations() encodes the PDF as base64, sends it
-        # to Mistral OCR in 5-page chunks, and returns:
-        #   - ocr_response : the full stitched Mistral response object
-        #   - stats        : { time_taken, pages, cost, empty_pages }
-        #   - extracted_text : plain text extracted from all pages
-        print("[PROCESS] Step 1/3 — Running Mistral OCR...")
+        print(f"[PROCESS] Step 1/3 — Running Mistral OCR (fmt={t_fmt}, conf={c_lvl})...")
         ocr_response, processing_stats, extracted_text = process_ocr_with_annotations(
             file_path=temp_file_path,
-            include_images=True,         # include image data in the response
+            include_images=True,
+            table_format=t_fmt,
+            confidence_granularity=c_lvl,
+            extract_header=extract_header,
+            extract_footer=extract_footer
         )
 
         if ocr_response is None:

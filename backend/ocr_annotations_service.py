@@ -124,23 +124,26 @@ def _log_page_result(global_page_index: int, page) -> None:
 
 # ─── Main OCR Processing Function ────────────────────────────────────────────
 
-def process_ocr_with_annotations(file_path: str, include_images: bool = False):
+def process_ocr_with_annotations(
+    file_path: str, 
+    include_images: bool = False,
+    table_format: str = None,         # "html", "markdown", or None
+    confidence_granularity: str = None, # "page", "word", or None
+    extract_header: bool = False,
+    extract_footer: bool = False,
+):
     """
     Processes a PDF file through the Mistral OCR API and returns structured results.
 
     Arguments:
-        file_path     : Absolute path to the PDF file on disk
-        include_images: If True, each image on every page is returned as base64 data
-                        in the response (increases response size significantly)
+        file_path              : Absolute path to the PDF file on disk
+        include_images         : If True, returns image base64 data in the response
+        table_format           : Format for table extraction ("html", "markdown", or None)
+        confidence_granularity : Granularity for confidence scores ("page" or "word")
+        extract_header         : If True, specifically extracts header content
+        extract_footer         : If True, specifically extracts footer content
 
     Returns a tuple: (ocr_response, stats_dict, clean_text)
-        ocr_response : The final stitched Mistral OCR response object
-                       (contains .pages[], each with .markdown, .images, .tables,
-                        and .document_annotation)
-        stats_dict   : { time_taken, pages, cost, empty_pages }
-        clean_text   : Full extracted text as a plain string, one section per page
-
-    On any unrecoverable error, returns: (None, None, error_message_string)
     """
     processing_start_time = time.time()
 
@@ -232,6 +235,12 @@ def process_ocr_with_annotations(file_path: str, include_images: bool = False):
                         # If True, every detected image is returned as base64 data
                         # inside the response — useful for image extraction pipelines
                         include_image_base64=include_images,
+
+                        # --- Advanced Parameters (OCR 2512+ Capabilities) ---
+                        table_format=table_format,
+                        confidence_scores_granularity=confidence_granularity,
+                        extract_header=extract_header,
+                        extract_footer=extract_footer,
                     )
                     # Success — exit the retry loop
                     break
