@@ -570,6 +570,67 @@ pre, code { font-family: 'Cascadia Code', 'Fira Code', monospace; }
 }
 .btn-secondary:hover { background: var(--surface-hover); border-color: var(--text-muted); }
 
+/* BBox Image Annotations list */
+.img-annotation-list {
+  display: flex;
+  flex-direction: column;
+  padding: 12px;
+  gap: 12px;
+  max-height: 400px;
+  overflow-y: auto;
+  background: rgba(0, 0, 0, 0.1);
+}
+
+.img-annotation-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: transform 0.2s ease, border-color 0.2s ease;
+}
+
+.img-annotation-card:hover {
+  border-color: rgba(157, 80, 187, 0.4);
+  transform: translateY(-2px);
+}
+
+.img-annotation-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.img-annotation-page {
+  font-size: 0.65rem;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+}
+
+.img-annotation-desc {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.4;
+}
+
+.img-annotation-summary {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  line-height: 1.5;
+  background: rgba(0, 0, 0, 0.15);
+  padding: 8px 10px;
+  border-radius: 8px;
+  border-left: 2px solid var(--border);
+}
+
+/* Badge variants */
+.badge-primary { background: rgba(157, 80, 187, 0.15); color: var(--primary); }
+.badge-muted   { background: rgba(136, 136, 152, 0.15); color: var(--text-muted); }
+
 /* ── Shared Utilities ────────────────────────────────────────────────────────── */
 .gradient-text {
   background: linear-gradient(135deg, #c084fc 0%, #e879f9 60%, #fb7185 100%);

@@ -1,291 +1,320 @@
 """
 pdf_highlight.py
-Creates an interleaved OCR report PDF:
-  • Each source page is reproduced with coloured bounding-box overlays.
-    Red  = images / figures  |  Blue = tables
-  • A text strip with the OCR-extracted text is appended directly below each page.
-    Rendered with PyMuPDF native text tools — fully Unicode safe, no ReportLab needed.
+================
+Service for generating an "Interleaved OCR Report" PDF.
+
+This module takes the original uploaded PDF and the structured results from the
+Mistral OCR API to build a new document where:
+  1. Each original page is reproduced.
+  2. Detected images (bbox_annotations) are highlighted with RED boxes.
+  3. Detected tables are highlighted with BLUE boxes.
+  4. A dedicated "Text Strip" is appended below each page showing the clean,
+     extracted markdown text rendered with PyMuPDF's auto-wrapping text engine.
+
+How it works:
+  - We use PyMuPDF (fitz) to manipulate the PDF.
+  - Mistral returns bounding boxes in a normalised 0–1000 coordinate system.
+  - We convert these to PDF "points" (1/72 inch) based on the actual page dimensions.
+  - We create a new, taller page for each original page to make room for the OCR text.
+  - All rendering is done using built-in fonts (Helvetica) to ensure the file 
+    is lightweight and Unicode-safe without needing external font files.
+
+Drawing Logic:
+  - top-left     (0, 0)   → top of the page
+  - source pdf   (0, 0, w, h)
+  - extra area   (0, h, w, h + extra_height)
 """
 
 import re
 import traceback
-import fitz          # PyMuPDF
+import fitz          # PyMuPDF — the industry-standard PDF manipulation library
 
 
-# ── Constants ──────────────────────────────────────────────────────────────────
-GRID      = 1000.0   # Mistral normalises bbox to 0–1000 per axis
-FONT_S    = 9        # body font size (pt)
-LINE_LEAD = 1.35     # line-height multiplier
-MARGIN    = 10       # horizontal margin (pt)
-HEADER_H  = 22       # height of the coloured page-header bar (pt)
+# ─── Constants & Styling ──────────────────────────────────────────────────────
 
-# Deep-purple header colours (RGB 0-1)
-HEADER_BG  = (0.18, 0.06, 0.38)
-HEADER_FG  = (1.0,  1.0,  1.0)
-BODY_FG    = (0.05, 0.05, 0.12)
-EMPTY_FG   = (0.45, 0.45, 0.50)
+# Mistral OCR normalises all coordinates to a 1000x1000 grid regardless of
+# the actual physical size of the page.
+MISTRAL_GRID_SIZE = 1000.0
+
+BODY_FONT_SIZE    = 9        # Font size for extracted text (pt)
+LINE_HEIGHT_MULT  = 1.35     # Leading multiplier (line-height)
+PAGE_MARGIN       = 10       # Left/right margin for text (pt)
+HEADER_HEIGHT     = 22       # Height of the purple "EXTRACTED TEXT" bar (pt)
+
+# Premium Color Palette (RGB 0-1)
+# Using deep purples and high-contrast whites for a modern aesthetic.
+COLOR_HEADER_BG = (0.18, 0.06, 0.38)   # Deep Purple
+COLOR_HEADER_FG = (1.0,  1.0,  1.0)      # White
+COLOR_BODY_TEXT = (0.05, 0.05, 0.12)   # Near-Black
+COLOR_EMPTY_MSG = (0.45, 0.45, 0.50)   # Medium Grey
+COLOR_BBOX_IMG  = (0.90, 0.10, 0.10)   # Vivid Red
+COLOR_BBOX_TBL  = (0.10, 0.20, 0.90)   # Vivid Blue
 
 
-# ── BBox normaliser ────────────────────────────────────────────────────────────
+# ─── BBox Extraction Helper ───────────────────────────────────────────────────
 
-def _extract_bbox(obj) -> list | None:
+def _resolve_bbox_coordinates(bbox_object) -> list | None:
     """
-    Extract [x0, y0, x1, y1] from a Mistral OCR image or table object.
+    Normalises the bounding box coordinates returned by the Mistral SDK.
 
-    Handles all known SDK versions / formats:
-      1. Mistral v0 SDK  — flat individual attrs: top_left_x, top_left_y,
-                           bottom_right_x, bottom_right_y  (confirmed from debug)
-      2. Generic object  — .top_left / .bottom_right with .x/.y sub-attrs
-      3. Nested .bbox    — list [x0,y0,x1,y1]  OR  object  OR  dict
+    Mistral's structured JSON for images/tables can store coordinates in
+    a few different attributes depending on the specific model/SDK version:
+      1. Flat attributes (top_left_x, top_left_y, ...)
+      2. A nested .bbox list [x0, y0, x1, y1]
+      3. A nested .bbox object with .top_left and .bottom_right sub-objects
+
+    Returns:
+        [x0, y0, x1, y1] if successful, else None.
     """
-    if obj is None:
+    if bbox_object is None:
         return None
 
-    # ── Format 1: Mistral v0 — flat attributes on the image/table object ──────
-    if hasattr(obj, "top_left_x"):
+    # Handle Flat Attributes (Common in the Mistral SDK 1.x / V0)
+    if hasattr(bbox_object, "top_left_x"):
         try:
             return [
-                float(obj.top_left_x),  float(obj.top_left_y),
-                float(obj.bottom_right_x), float(obj.bottom_right_y),
+                float(bbox_object.top_left_x),     float(bbox_object.top_left_y),
+                float(bbox_object.bottom_right_x), float(bbox_object.bottom_right_y)
             ]
         except (TypeError, ValueError, AttributeError):
             pass
 
-    # ── Format 2+3: Nested .bbox attribute ───────────────────────────────────
-    raw = getattr(obj, "bbox", None)
-    if raw is None:
+    # Handle Nested .bbox attribute
+    raw_bbox = getattr(bbox_object, "bbox", None)
+    if raw_bbox is None:
         return None
 
-    # 2a. Plain list / tuple of 4 numbers
-    if isinstance(raw, (list, tuple)) and len(raw) == 4:
+    # bbox as a list: [x0, y0, x1, y1]
+    if isinstance(raw_bbox, (list, tuple)) and len(raw_bbox) == 4:
         try:
-            return [float(raw[0]), float(raw[1]), float(raw[2]), float(raw[3])]
+            return [float(c) for c in raw_bbox]
         except (TypeError, ValueError):
             pass
 
-    # 2b. Object with .top_left / .bottom_right having .x / .y
-    if hasattr(raw, "top_left") and hasattr(raw, "bottom_right"):
-        tl, br = raw.top_left, raw.bottom_right
+    # bbox as an object with .top_left and .bottom_right
+    if hasattr(raw_bbox, "top_left") and hasattr(raw_bbox, "bottom_right"):
+        tl, br = raw_bbox.top_left, raw_bbox.bottom_right
         try:
+            # Check for .x / .y attributes
             if hasattr(tl, "x"):
                 return [float(tl.x), float(tl.y), float(br.x), float(br.y)]
+            # Check for list [x, y] format
             if isinstance(tl, (list, tuple)):
                 return [float(tl[0]), float(tl[1]), float(br[0]), float(br[1])]
         except (TypeError, ValueError):
             pass
 
-    # 2c. Dict with top_left / bottom_right keys
-    if isinstance(raw, dict):
-        tl = raw.get("top_left")
-        br = raw.get("bottom_right")
-        if tl and br:
-            try:
-                if isinstance(tl, dict):
-                    return [float(tl.get("x", 0)), float(tl.get("y", 0)),
-                            float(br.get("x", 0)), float(br.get("y", 0))]
-                if isinstance(tl, (list, tuple)):
-                    return [float(tl[0]), float(tl[1]), float(br[0]), float(br[1])]
-            except (TypeError, ValueError):
-                pass
-
     return None
 
 
-# ── Markdown → plain text ──────────────────────────────────────────────────────
+# ─── Text Cleaning Helper ─────────────────────────────────────────────────────
 
-def _clean(md: str) -> str:
-    """Strip markdown syntax so plain text renders cleanly in the PDF."""
-    md = re.sub(r'!\[.*?\]\(.*?\)', '', md)                       # image refs
-    md = re.sub(r'^\s*#{1,6}\s+', '', md, flags=re.MULTILINE)    # headings
-    md = re.sub(r'\*{1,3}(.*?)\*{1,3}', r'\1', md)              # bold/italic
-    md = re.sub(r'^\s*---+\s*$', '', md, flags=re.MULTILINE)     # hr (but NOT table seps)
-    md = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', md)            # links → text only
-    md = re.sub(r'`+', '', md)                                    # backticks
-    return md.strip()
-
-
-# ── Text-strip height estimator ────────────────────────────────────────────────
-
-def _estimate_extra_h(text: str, page_width: float) -> float:
+def _strip_markdown_for_rendering(markdown_text: str) -> str:
     """
-    Estimate the height needed for the text strip using PyMuPDF's built-in
-    text measurement, then add header + margins.
+    Cleans markdown syntax so the plain text looks professional in the PDF.
+
+    We remove:
+      - Image references like ![img.png](...)
+      - Heading markers (# ## ###)
+      - Bold/Italic stars (* **)
+      - Horizontal rules (---)
+      - Links (converting [text](url) → text)
+    """
+    text = markdown_text or ""
+    text = re.sub(r'!\[.*?\]\(.*?\)', '', text)                      # Remove images
+    text = re.sub(r'^\s*#{1,6}\s+', '', text, flags=re.MULTILINE)   # Remove headers
+    text = re.sub(r'\*{1,3}(.*?)\*{1,3}', r'\1', text)             # Remove bold/italic
+    text = re.sub(r'^\s*---+\s*$', '', text, flags=re.MULTILINE)    # Remove separators
+    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)           # Remove links
+    text = re.sub(r'`+', '', text)                                   # Remove code ticks
+    return text.strip()
+
+
+# ─── Height Estimation ────────────────────────────────────────────────────────
+
+def _estimate_text_strip_height(text: str, page_width: float) -> float:
+    """
+    Estimates the height (in points) needed to display the extracted text strip.
+
+    Calculation:
+      - Calculates characters per line based on page width.
+      - Counts manual newlines and estimates wrapped lines.
+      - Adds fixed height for the header bar and margins.
     """
     if not text:
-        return float(HEADER_H + 30)
+        return float(HEADER_HEIGHT + 30)
 
-    # Use PyMuPDF's font metrics to measure how many lines we need.
-    # fontsize=FONT_S, line-height factor LINE_LEAD.
-    chars_per_line = max(1, int((page_width - 2 * MARGIN) / (FONT_S * 0.55)))
-    raw_lines = text.split("\n")
-    wrapped_count = 0
-    for ln in raw_lines:
-        wrapped_count += max(1, int(len(ln) / chars_per_line) + 1)
+    # Simple char-width estimation (Helvetica is ~0.55em wide on average)
+    available_width = page_width - (2 * PAGE_MARGIN)
+    chars_per_line  = max(1, int(available_width / (BODY_FONT_SIZE * 0.55)))
 
-    line_h  = FONT_S * LINE_LEAD
-    needed  = HEADER_H + wrapped_count * line_h + MARGIN * 2
-    capped  = min(needed, 14 * 72)   # cap at 14 inches (1008 pt)
-    return float(max(capped, HEADER_H + 40))
+    # Count estimated lines
+    raw_paragraphs = text.split("\n")
+    total_lines    = 0
+    for para in raw_paragraphs:
+        # Every paragraph takes at least 1 line, plus extra for wrapping
+        total_lines += max(1, int(len(para) / chars_per_line) + 1)
+
+    # Points needed = (Header + Margins + (Lines * line_height))
+    line_h = BODY_FONT_SIZE * LINE_HEIGHT_MULT
+    needed = HEADER_HEIGHT + (total_lines * line_h) + (PAGE_MARGIN * 2)
+
+    # Cap page height at 14 inches (1008 pts) to prevent creating invalid PDF pages
+    return float(max(40, min(needed, 1008)))
 
 
-# ── Main export ────────────────────────────────────────────────────────────────
+# ─── Main Export Function ─────────────────────────────────────────────────────
 
-def highlight_text_in_pdf(input_pdf_path: str, output_pdf_path: str,
-                           ocr_text: str, ocr_response) -> str:
+def highlight_text_in_pdf(
+    original_pdf_path: str,
+    output_pdf_path:   str,
+    extracted_text:    str,
+    ocr_response,
+) -> str:
     """
-    Build the interleaved OCR report PDF.
+    Generates a new PDF report with bounding box highlights and text strips.
 
-    All drawing is done with PyMuPDF native methods (Unicode-safe, no ReportLab).
-    All page logic is inside the 'for i, src_page' loop so index 'i' is always
-    in scope — no helper functions that lose the loop variable.
+    Pipeline:
+      1. Opens the source PDF.
+      2. Iterates through each page.
+      3. Draws RED boxes around detected images and BLUE boxes around tables.
+      4. Appends a new section at the bottom of the page containing the clean OCR text.
+      5. Saves the final production PDF to disk.
     """
-    src_doc       = fitz.open(input_pdf_path)
-    res_doc       = fitz.open()
+    src_pdf       = fitz.open(original_pdf_path)
+    report_pdf    = fitz.open()   # Create a new, empty PDF document
     mistral_pages = getattr(ocr_response, "pages", []) or []
 
-    print(f"[PDF] Building report: {len(src_doc)} src pages | "
-          f"{len(mistral_pages)} OCR pages")
+    print(f"[PDF] Generating report: {len(src_pdf)} pages")
 
-    for i, src_page in enumerate(src_doc):
+    for i, source_page in enumerate(src_pdf):
         try:
-            w = src_page.rect.width    # visual width  (after rotation)
-            h = src_page.rect.height   # visual height (after rotation)
-            r = src_page.rotation      # 0 / 90 / 180 / 270
+            # Get dimensions (handles rotated pages correctly)
+            width  = source_page.rect.width
+            height = source_page.rect.height
+            rot    = source_page.rotation  # 0, 90, 180, or 270
 
-            # ── Retrieve Mistral OCR data for this page ────────────────────
-            m_page  = mistral_pages[i] if i < len(mistral_pages) else None
-            raw_md  = (getattr(m_page, "markdown", "") or "") if m_page else ""
-            cleaned = _clean(raw_md)
+            # Get OCR data for this specific page
+            page_data = mistral_pages[i] if i < len(mistral_pages) else None
+            markdown  = (getattr(page_data, "markdown", "") or "") if page_data else ""
+            cleaned_text = _strip_markdown_for_rendering(markdown)
 
-            images = list(getattr(m_page, "images",  None) or []) if m_page else []
-            tables = list(getattr(m_page, "tables",  None) or []) if m_page else []
+            page_images = list(getattr(page_data, "images", []) or []) if page_data else []
+            page_tables = list(getattr(page_data, "tables", []) or []) if page_data else []
 
-            # ── Debug: show first image attributes on page 1 ─────────────
-            if i == 0 and images:
-                img0   = images[0]
-                b_test = _extract_bbox(img0)
-                print(f"[PDF Debug] Page 1 image bbox resolved to: {b_test}")
+            # ── Step A: Create the new, larger page ───────────────────────────
+            #
+            # We add "extra_height" to the bottom of each page to fit the OCR text.
+            extra_h = _estimate_text_strip_height(cleaned_text, width)
 
-            # ── Calculate text strip height ────────────────────────────────
-            extra_h = _estimate_extra_h(cleaned, w)
-
-            # ── Create new (taller) page ───────────────────────────────────
-            if r in (90, 270):
-                new_page = res_doc.new_page(width=h + extra_h, height=w)
+            # PyMuPDF correctly handles rotation if we swap W/H appropriately
+            if rot in (90, 270):
+                new_page = report_pdf.new_page(width=height + extra_h, height=width)
             else:
-                new_page = res_doc.new_page(width=w, height=h + extra_h)
-            new_page.set_rotation(r)
+                new_page = report_pdf.new_page(width=width, height=height + extra_h)
 
-            # ── Copy original source page into the top section ─────────────
-            # show_pdf_page uses VISUAL coordinates, so (0,0,w,h) is always correct.
-            new_page.show_pdf_page(fitz.Rect(0, 0, w, h), src_doc, i)
+            new_page.set_rotation(rot)
 
-            # ── Draw bounding boxes ────────────────────────────────────────
-            for img_obj in images:
-                b = _extract_bbox(img_obj)
-                if b:
-                    try:
-                        rect = fitz.Rect(b[0] * w / GRID, b[1] * h / GRID,
-                                         b[2] * w / GRID, b[3] * h / GRID)
-                        new_page.draw_rect(rect, color=(0.9, 0.1, 0.1),
-                                           fill=None, width=2.5)
-                    except Exception as be:
-                        print(f"[PDF]   Page {i+1}: image bbox draw error: {be}")
+            # ── Step B: Copy original PDF content ─────────────────────────────
+            #
+            # We place the original page content inside the top rectangle (0, 0, w, h).
+            # The remaining bottom area (h, w, h+extra_h) will be our text strip.
+            new_page.show_pdf_page(fitz.Rect(0, 0, width, height), src_pdf, i)
 
-            for tbl_obj in tables:
-                b = _extract_bbox(tbl_obj)
-                if b:
-                    try:
-                        rect = fitz.Rect(b[0] * w / GRID, b[1] * h / GRID,
-                                         b[2] * w / GRID, b[3] * h / GRID)
-                        new_page.draw_rect(rect, color=(0.1, 0.2, 0.9),
-                                           fill=None, width=2.5)
-                    except Exception as be:
-                        print(f"[PDF]   Page {i+1}: table bbox draw error: {be}")
+            # ── Step C: Draw Bounding Boxes ───────────────────────────────────
+            #
+            # Coordinate Conversion:
+            #   Mistral (0-1000) → PDF Points (actual width/height)
+            #   pdf_x = (mistral_x / 1000) * actual_width
 
-            # ── Render text strip directly on the new page ─────────────────
-            # The text strip lives in the VISUAL region (0, h) → (w, h+extra_h).
-            # For r=0 / r=180, visual coords == pre-transform coords, so
-            # PyMuPDF's native draw/text functions work as-is.
-            # For r=90 / r=270, the strip ends up at the page "right side" visually
-            # but still shows the correct content.
+            # Draw IMAGES in RED
+            for img in page_images:
+                coords = _resolve_bbox_coordinates(img)
+                if coords:
+                    rect = fitz.Rect(
+                        coords[0] * width  / MISTRAL_GRID_SIZE, coords[1] * height / MISTRAL_GRID_SIZE,
+                        coords[2] * width  / MISTRAL_GRID_SIZE, coords[3] * height / MISTRAL_GRID_SIZE
+                    )
+                    new_page.draw_rect(rect, color=COLOR_BBOX_IMG, width=2.0)
 
-            strip_top    = h                          # top of strip in visual y
-            strip_bottom = h + extra_h                # bottom of strip
-            header_bot   = strip_top + HEADER_H       # bottom of header bar
+            # Draw TABLES in BLUE
+            for tbl in page_tables:
+                coords = _resolve_bbox_coordinates(tbl)
+                if coords:
+                    rect = fitz.Rect(
+                        coords[0] * width  / MISTRAL_GRID_SIZE, coords[1] * height / MISTRAL_GRID_SIZE,
+                        coords[2] * width  / MISTRAL_GRID_SIZE, coords[3] * height / MISTRAL_GRID_SIZE
+                    )
+                    new_page.draw_rect(rect, color=COLOR_BBOX_TBL, width=2.0)
 
-            # Coloured header background
+            # ── Step D: Render the Text Strip ─────────────────────────────────
+
+            strip_y_start    = height
+            strip_y_end      = height + extra_h
+            header_bar_end   = strip_y_start + HEADER_HEIGHT
+
+            # 1. Header background (Deep Purple)
             new_page.draw_rect(
-                fitz.Rect(0, strip_top, w, header_bot),
+                fitz.Rect(0, strip_y_start, width, header_bar_end),
                 color=None,
-                fill=HEADER_BG,
+                fill=COLOR_HEADER_BG,
             )
 
-            # Header label
+            # 2. Header text
             new_page.insert_text(
-                (MARGIN, header_bot - 6),
-                f"PAGE {i + 1}  \u2014  EXTRACTED OCR TEXT",
-                fontname="hebo",          # Helvetica-Bold (built-in)
+                (PAGE_MARGIN, header_bar_end - 6),
+                f"PAGE {i + 1}  \u2014  MISTRAL OCR EXTRACTED TEXT",
+                fontname="hebo",   # Helvetica-Bold
                 fontsize=8,
-                color=HEADER_FG,
+                color=COLOR_HEADER_FG,
             )
 
-            # Body text — PyMuPDF insert_textbox is Unicode-safe and auto-wraps
-            body_rect = fitz.Rect(
-                MARGIN,
-                header_bot + 4,
-                w - MARGIN,
-                strip_bottom - 4,
+            # 3. Body OCR Text (Auto-wrapping textbox)
+            text_rect = fitz.Rect(
+                PAGE_MARGIN,
+                header_bar_end + 6,
+                width - PAGE_MARGIN,
+                strip_y_end - PAGE_MARGIN
             )
 
-            if cleaned:
-                overflow = new_page.insert_textbox(
-                    body_rect,
-                    cleaned,
-                    fontname="helv",      # Helvetica (built-in)
-                    fontsize=FONT_S,
-                    lineheight=LINE_LEAD,
-                    color=BODY_FG,
-                    align=0,              # left-align
+            if cleaned_text:
+                new_page.insert_textbox(
+                    text_rect,
+                    cleaned_text,
+                    fontname="helv",   # Helvetica
+                    fontsize=BODY_FONT_SIZE,
+                    lineheight=LINE_HEIGHT_MULT,
+                    color=COLOR_BODY_TEXT,
+                    align=0            # Left align
                 )
-                if overflow < 0:
-                    # Some text was clipped — increase extra_h estimate next time
-                    print(f"[PDF]   Page {i+1}: WARNING text overflow "
-                          f"({-overflow:.0f}pt clipped — "
-                          f"full text is in Raw Text tab)")
             else:
                 new_page.insert_text(
-                    (MARGIN, header_bot + 18),
-                    "[No text extracted from this page]",
+                    (PAGE_MARGIN, header_bar_end + 18),
+                    "[No extractable text found on this page]",
                     fontname="helv",
                     fontsize=8,
-                    color=EMPTY_FG,
+                    color=COLOR_EMPTY_MSG
                 )
 
-            print(f"[PDF]   Page {i + 1}: OK  "
-                  f"(text={len(cleaned)}chars, strip={extra_h:.0f}pt, "
-                  f"imgs={len(images)}, tables={len(tables)})")
+            print(f"[PDF]   Page {i+1} processed successfully.")
 
-        except Exception as e:
-            print(f"[PDF] Page {i+1} FAILED: {e}")
+        except Exception as page_err:
+            print(f"[PDF]   Page {i+1} failed: {page_err}")
             traceback.print_exc()
-
-            # Remove any partially-created page before adding the fallback copy
-            if len(res_doc) > i:
-                res_doc.delete_page(-1)
-
+            # If a complex page fails, we try to at least provide a plain copy
+            # so the report isn't completely missing pages.
             try:
-                w2 = src_page.rect.width
-                h2 = src_page.rect.height
-                fb = res_doc.new_page(width=w2, height=h2)
-                fb.set_rotation(src_page.rotation)
-                fb.show_pdf_page(fitz.Rect(0, 0, w2, h2), src_doc, i)
-                print(f"[PDF]   Page {i+1}: fallback plain copy saved")
-            except Exception as fe:
-                print(f"[PDF]   Page {i+1}: fallback also failed: {fe}")
+                fallback_page = report_pdf.new_page(width=source_page.rect.width, height=source_page.rect.height)
+                fallback_page.set_rotation(source_page.rotation)
+                fallback_page.show_pdf_page(source_page.rect, src_pdf, i)
+                print(f"[PDF]   Page {i+1} fallback plain copy used.")
+            except:
+                pass
 
-    res_doc.save(output_pdf_path)
-    res_doc.close()
-    src_doc.close()
-    print(f"[PDF] Report saved: {output_pdf_path}")
+    # 4. Finalise and Save
+    report_pdf.save(output_pdf_path)
+    report_pdf.close()
+    src_pdf.close()
+
+    print(f"[PDF] ✓ Report generated → {output_pdf_path}")
     return output_pdf_path

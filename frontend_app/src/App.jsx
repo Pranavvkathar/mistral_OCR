@@ -21,6 +21,7 @@ import {
   AlignLeft,
   ChevronDown,
   ChevronUp,
+  ImageIcon,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
@@ -169,6 +170,67 @@ function PageStatsTable({ pages }) {
               )}
             </tbody>
           </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Image Annotations Panel ──────────────────────────────────────────────────
+// Displays the bbox_annotation results — one card per detected image region.
+// Each card shows image_type, short_description, and summary from ImageAnnotation.
+
+function ImageAnnotationsPanel({ pages }) {
+  const [expanded, setExpanded] = useState(false);
+
+  // Collect all images that have a bbox annotation attached
+  const annotatedImages = (pages || []).flatMap((page, pageIdx) =>
+    (page.images || []).filter(img => img.bbox_annotation).map(img => ({
+      pageNumber:       pageIdx + 1,
+      imageType:        img.bbox_annotation?.image_type        || 'unknown',
+      shortDescription: img.bbox_annotation?.short_description || '',
+      summary:          img.bbox_annotation?.summary           || '',
+    }))
+  );
+
+  if (annotatedImages.length === 0) return null;
+
+  const displayed = expanded ? annotatedImages : annotatedImages.slice(0, 3);
+
+  // Badge colour per image type
+  const typeColor = { graph: 'primary', table: 'ok', text: 'warn', image: 'muted', unknown: 'muted' };
+
+  return (
+    <div className="page-stats-wrap">
+      <button className="page-stats-header" onClick={() => setExpanded(e => !e)}>
+        <ImageIcon size={14} />
+        <span>Image Annotations ({annotatedImages.length} detected)</span>
+        {expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+      </button>
+
+      {expanded && (
+        <div className="img-annotation-list">
+          {displayed.map((img, i) => (
+            <div key={i} className="img-annotation-card">
+              <div className="img-annotation-header">
+                <span className={`badge badge-${typeColor[img.imageType] || 'muted'}`}>
+                  {img.imageType}
+                </span>
+                <span className="img-annotation-page">Page {img.pageNumber}</span>
+              </div>
+              {img.shortDescription && (
+                <p className="img-annotation-desc">{img.shortDescription}</p>
+              )}
+              {img.summary && (
+                <p className="img-annotation-summary">{img.summary}</p>
+              )}
+            </div>
+          ))}
+          {!expanded && annotatedImages.length > 3 && (
+            <p className="text-center text-muted text-xs py-1">
+              + {annotatedImages.length - 3} more…
+            </p>
+          )}
         </div>
       )}
     </div>
@@ -578,6 +640,9 @@ function App() {
 
                           {/* Per-page stats */}
                           <PageStatsTable pages={pagesData} />
+
+                          {/* BBox Image Annotations — short_description + summary per image */}
+                          <ImageAnnotationsPanel pages={pagesData} />
 
                           {/* Raw JSON */}
                           <details>
