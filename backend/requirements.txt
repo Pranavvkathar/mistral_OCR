@@ -1,9 +1,0 @@
-fastapi
-uvicorn
-python-dotenv
-mistralai
-python-multipart
-reportlab
-pymupdf
-httpx
-motor
